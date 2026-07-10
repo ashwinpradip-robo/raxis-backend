@@ -93,7 +93,7 @@ async function callBedrock(
         const err = await response.text().catch(() => response.statusText);
         throw new Error(`Bedrock error ${response.status}: ${err}`);
       }
-      const data = await response.json();
+      const data = await response.json() as { content?: Array<{ text?: string }> };
       return stripFences(data.content?.[0]?.text ?? "");
     } catch (err) {
       if (attempt < 2) { await new Promise(r => setTimeout(r, delays[attempt])); attempt++; }
@@ -166,7 +166,7 @@ async function callAnthropicClaude(
       });
       if (response.status === 429 && attempt < 2) { await new Promise(r => setTimeout(r, delays[attempt])); attempt++; continue; }
       if (!response.ok) { const err = await response.text().catch(() => response.statusText); throw new Error(`Claude error ${response.status}: ${err}`); }
-      const data = await response.json();
+      const data = await response.json() as { content?: Array<{ text?: string }> };
       return stripFences(data.content?.[0]?.text ?? "");
     } catch (err) {
       if (attempt < 2) { await new Promise(r => setTimeout(r, delays[attempt])); attempt++; } else throw err;
@@ -196,7 +196,7 @@ async function callGemini(
       });
       if (response.status === 429 && attempt < 2) { await new Promise(r => setTimeout(r, delays[attempt])); attempt++; continue; }
       if (!response.ok) { const err = await response.text().catch(() => response.statusText); throw new Error(`Gemini error ${response.status}: ${err}`); }
-      const data = await response.json();
+      const data = await response.json() as { candidates?: Array<{ content?: { parts?: Array<{ text?: string }> } }> };
       return stripFences(data.candidates?.[0]?.content?.parts?.[0]?.text ?? "");
     } catch (err) {
       if (attempt < 2) { await new Promise(r => setTimeout(r, delays[attempt])); attempt++; } else throw err;

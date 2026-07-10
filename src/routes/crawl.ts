@@ -52,7 +52,14 @@ async function crawlWithFirecrawl(url: string): Promise<{
       throw new Error(`Firecrawl API error ${response.status}: ${errorText}`);
     }
 
-    const data = await response.json();
+    const data = await response.json() as {
+      success?: boolean;
+      data?: {
+        markdown?: string;
+        metadata?: Record<string, unknown>;
+        links?: string[];
+      };
+    };
 
     if (!data.success || !data.data) {
       throw new Error("Firecrawl returned no data");
