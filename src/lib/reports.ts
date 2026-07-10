@@ -482,6 +482,9 @@ function escapeHtml(text: string): string {
 async function generatePdfBuffer(html: string): Promise<Buffer> {
   const browser = await puppeteer.launch({
     headless: true,
+    // In Docker (Render), use pre-installed Chromium via PUPPETEER_EXECUTABLE_PATH env var
+    // In local dev, fall back to Puppeteer's bundled Chromium
+    executablePath: process.env.PUPPETEER_EXECUTABLE_PATH || undefined,
     args: ["--no-sandbox", "--disable-setuid-sandbox"],
   });
 
