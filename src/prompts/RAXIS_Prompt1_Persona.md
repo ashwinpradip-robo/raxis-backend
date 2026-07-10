@@ -35,7 +35,7 @@ Read a raw Firecrawl snapshot of one website and produce:
 (a) a business context classification on four axes,
 (b) a constraint profile recording which data categories are public-appropriate,
     governed, or never-expose, and
-(c) 2 to 4 suggested agent personas drawn only from the fixed catalog in the spec.
+(c) 2 to 8 suggested agent personas drawn only from the fixed catalog in the spec.
 
 HARD RULES — NEVER BREAK THESE
 1. Closed catalogs only. Every axis value and every persona must come from the closed
@@ -55,8 +55,13 @@ HARD RULES — NEVER BREAK THESE
    constraint_profile.notes. Default to public-appropriate if justification is weak.
 4. Suggest, do not decide. Set selected: true on every persona you return. The
    consultant toggles selection on the next screen. Never pre-deselect.
-5. Bounded count. Return at least 2 and at most 4 personas. If more than 4 are
-   plausible, keep the 4 highest-relevance ones and note the rest in justification
+5. Bounded count. Return at least 2 and at most 8 personas. Actively consider every
+   one of the 10 personas in the catalog — do not stop at 4 by default. For each
+   catalog persona, check if the site has surfaces that persona would need. If yes,
+   include it. Typical sites should return 4–6 personas; complex sites with checkout,
+   booking, developer, support, and monitoring surfaces should return 6–8. If more
+   than 8 are plausible, keep the 8 highest-relevance ones and note the rest in
+   justification prose.
    text. Never return fewer than 2.
 6. Evidence-grounded relevance. A persona is relevant only if the site has or
    plausibly targets the surfaces that persona needs. Ground relevance in observed
@@ -154,7 +159,7 @@ Return only the JSON described in the system message.
 ### 1. Parse and validate
 - Strip any accidental markdown fences before `JSON.parse()`
 - Confirm top-level keys: `spec_version`, `framework_version`, `evidence`, `business_context`, `personas`
-- Confirm `personas` array length is 2–4
+- Confirm `personas` array length is 2–8
 - Confirm every `persona_id` is from the valid set
 - If validation fails: retry once with an explicit JSON-only instruction. If it fails again, set assessment status to `failed`
 
@@ -185,7 +190,7 @@ Keep the full persona object in state so `persona_id`, `catalog_persona`, `relev
 
 ## Self-check (backend validation before storing)
 
-- [ ] `personas` has 2–4 entries
+- [ ] `personas` has 2–8 entries
 - [ ] Every `persona_id` is in the valid closed set
 - [ ] Every `selected` field is `true` (pre-confirmation)
 - [ ] Every persona has a non-empty `justification` and at least one `evidence_id`

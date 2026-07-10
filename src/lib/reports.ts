@@ -1,532 +1,463 @@
 // ─────────────────────────────────────────────────────────────────────────────
-// RAXIS — PDF and ZIP Generation
-// Generates the 4-page ARS Report PDF and the agent files ZIP.
-// Uploads both to Supabase Storage (raxis-reports bucket).
-// Called by the pipeline after Call 2 completes (PDF) and Call 4 completes (ZIP).
-//
-// PDF pages:
-//   Page 1 — Cover: Company, ARS Score, Dimension Scores
-//   Page 2 — Persona Breakdown + Severity Counts + Top Findings Overview
-//   Page 3 — Detailed Findings with Business Impact
-//   Page 4 — Parameter Definitions + Finding Priority Rationale
-//
-// ZIP contents:
-//   agents.md  — from agent_interface_bundle
-//   llms.txt   — from agent_interface_bundle
+// RAXIS Report Generation v2.0
+// Follows RAXIS_Report_Contents_Specification.docx exactly.
+// 7 sections: Cover, Headline, Business Context, Personas, Dimensions,
+//              Insights, Recommendations
+// Font: Segoe UI / Noto Sans · Colours: Navy #07174E + Red #C41B46
 // ─────────────────────────────────────────────────────────────────────────────
 
-import { supabase } from "../lib/supabase";
+import puppeteer from "puppeteer";
+import archiver from "archiver";
+import { supabase } from "./supabase";
 
-// ─────────────────────────────────────────────────────────────────────────────
-// Supabase Storage upload helper
-// ─────────────────────────────────────────────────────────────────────────────
-
-const BUCKET = "raxis-reports";
-const SIGNED_URL_EXPIRY = 60 * 60; // 1 hour in seconds
-
-async function uploadToSupabase(
-  buffer: Buffer,
-  filename: string,
-  contentType: string
-): Promise<string> {
-  const { error: uploadError } = await supabase.storage
-    .from(BUCKET)
-    .upload(filename, buffer, {
-      contentType,
-      upsert: true, // Overwrite if re-generating
-    });
-
-  if (uploadError) {
-    throw new Error(`Supabase Storage upload failed: ${uploadError.message}`);
-  }
-
-  const { data: signedData, error: signedError } = await supabase.storage
-    .from(BUCKET)
-    .createSignedUrl(filename, SIGNED_URL_EXPIRY);
-
-  if (signedError || !signedData?.signedUrl) {
-    throw new Error(`Failed to create signed URL: ${signedError?.message}`);
-  }
-
-  return signedData.signedUrl;
+// ── Helper: band anchor for dimension scores per spec Section 5 ───────────────
+function dimensionBand(score: number): { label: string; color: string } {
+  if (score >= 90) return { label: "Exemplary", color: "#0F7C4D" };
+  if (score >= 70) return { label: "Strong",    color: "#3C8C00" };
+  if (score >= 50) return { label: "Workable",  color: "#D98A1F" };
+  if (score >= 30) return { label: "Impaired",  color: "#C41B46" };
+  return              { label: "Blocking",  color: "#7C0F1F" };
 }
 
+function arsBandInfo(score: number | null): { label: string; verdict: string; color: string } {
+  const s = score ?? 0;
+  if (s >= 80) return { label: "Excellent",  verdict: "This site is highly ready for AI agents.", color: "#0F7C4D" };
+  if (s >= 60) return { label: "Good",       verdict: "This site is moderately ready for AI agents, with clear opportunities to improve.", color: "#3C8C00" };
+  if (s >= 40) return { label: "Needs Work", verdict: "This site has significant readiness gaps and requires targeted improvements before agents can rely on it.", color: "#D98A1F" };
+  return              { label: "Not Ready", verdict: "This site is not yet ready for AI agents and needs substantial work across most dimensions.", color: "#C41B46" };
+}
+
+const PRIORITY_COLORS: Record<string, string> = {
+  Critical: "#C41B46",
+  High:     "#D98A1F",
+  Medium:   "#3C8C00",
+};
+
 // ─────────────────────────────────────────────────────────────────────────────
-// HTML template for PDF rendering
-// Puppeteer renders this HTML to a 4-page PDF.
-// Matches the layout of the uploaded RAXIS-ARS-Report-hubspot_com.pdf mockup.
+// Build PDF HTML — all 7 sections per specification
 // ─────────────────────────────────────────────────────────────────────────────
 
-function buildPdfHtml(data: {
-  clientName:      string;
-  websiteUrl:      string;
-  assessmentId:    string;
-  arsScore:        number;
-  arsBand:         string;
-  dimensionScores: Array<{ name: string; score: number; weight: number }>;
-  personaScores:   Array<{ display_label: string; score: number; band: string }>;
-  severityCounts:  { Critical: number; High: number; Medium: number };
-  findings:        Array<{
-    severity: string;
-    title: string;
-    personas: string | string[];
-    dimension_id?: string;
-    business_impact: string;
-    description?: string;
-    priority_reason?: string;
-    maps_to_component?: string;
-  }>;
-  dimensionScoresFull: Array<{
-    name: string;
-    score: number;
-    weight: number;
-    description?: string;
-  }>;
-}): string {
-  const {
-    clientName, websiteUrl, assessmentId, arsScore, arsBand,
-    dimensionScores, personaScores, severityCounts, findings,
-    dimensionScoresFull,
-  } = data;
+interface PdfData {
+  clientName:       string;
+  websiteUrl:       string;
+  assessmentId:     string;
+  frameworkVersion: string;
+  generatedAt:      string;
+  // Section 2
+  arsScore:         number | null;
+  // Section 3
+  businessContext:  Record<string, unknown>;
+  // Section 4
+  personas:         Array<Record<string, unknown>>;
+  // Section 5
+  dimensionScores:  Array<Record<string, unknown>>;
+  // Section 6
+  insights:         Array<Record<string, unknown>>;
+  // Section 7
+  neededComponents: Array<Record<string, unknown>>;
+}
 
-  const bandLabel: Record<string, string> = {
-    excellent:  "EXCELLENT",
-    good:       "GOOD",
-    needs_work: "NEEDS WORK",
-    not_ready:  "NOT READY",
-  };
+function buildPdfHtml(d: PdfData): string {
+  const ars     = arsBandInfo(d.arsScore);
+  const dateStr = new Date(d.generatedAt).toLocaleDateString("en-GB", { year: "numeric", month: "long", day: "numeric" });
 
-  const bandColor: Record<string, string> = {
-    excellent:  "#15803d",
-    good:       "#1d4ed8",
-    needs_work: "#c2610c",
-    not_ready:  "#b91c1c",
-  };
+  // ── SECTION 3 helpers ──────────────────────────────────────────────────
+  const bc         = d.businessContext ?? {};
+  const archetype  = (bc.archetype_primary as string) ?? (bc.archetype as string) ?? "—";
+  const model      = (bc.business_model   as string) ?? (bc.model as string) ?? "—";
+  const primaryAct = (bc.primary_action_surface as string) ?? "—";
+  const audience   = (bc.audience         as string) ?? "—";
 
-  const sevColor: Record<string, string> = {
-    Critical: "#C41B46",
-    High:     "#D98A1F",
-    Medium:   "#3C8C00",
-  };
+  // ── SECTION 4 helpers ──────────────────────────────────────────────────
+  const confirmed = (d.personas ?? []).filter(p => p.selected !== false);
 
-  const hostname = (() => {
-    try { return new URL(websiteUrl).hostname; } catch { return websiteUrl; }
-  })();
-
-  const personasStr = (p: string | string[]) =>
-    Array.isArray(p) ? p.join(" · ") : p;
-
-  // Dimension descriptions (fallback if not provided by Claude)
-  const dimDescriptions: Record<string, string> = {
-    "Data Accessibility and Extractability":
-      "Measures whether product, pricing, and policy data is exposed in a machine-readable form rather than locked in images or client-side-only rendering.",
-    "Structured Data and Semantics":
-      "Evaluates the presence and accuracy of schema.org / JSON-LD markup that lets agents extract entities without heuristic scraping.",
-    "Content Structure and Navigation Semantics":
-      "Assesses semantic HTML structure — heading hierarchy, landmark regions, and consistent page templates.",
-    "Action Enablement":
-      "Checks whether key conversion actions can be completed by an agent without CAPTCHAs or JavaScript-only flows.",
-    "Navigation Clarity and Discoverability":
-      "Reviews sitemap completeness, internal linking, and URL predictability so agents can discover relevant pages.",
-    "API and Programmatic Access":
-      "Looks for documented, authenticated API endpoints that let integration agents call functionality programmatically.",
-    "Authentication and Access Barriers":
-      "Assesses how well the site documents and facilitates authenticated access for agents.",
-    "Content Freshness and Reliability Signals":
-      "Evaluates signals that help agents determine if content is current and trustworthy.",
-    "Trust, Verification and Safety Signals":
-      "Checks for signals that allow agents to verify the legitimacy of actions and data.",
-    "Bot Policy and Rate Limiting":
-      "Reviews the site's bot policy, robots.txt, and rate limiting for agent compatibility.",
-  };
-
-  return `<!DOCTYPE html>
-<html lang="en">
+  return `<!doctype html>
+<html>
 <head>
-<meta charset="UTF-8">
+<meta charset="utf-8" />
 <style>
-  * { margin: 0; padding: 0; box-sizing: border-box; }
+  @page { size: A4; margin: 0; }
+  * { box-sizing: border-box; }
   body {
-    font-family: 'Segoe UI', Arial, sans-serif;
+    margin: 0; padding: 0;
+    font-family: 'Segoe UI', 'Noto Sans', system-ui, sans-serif;
     color: #16181D;
     background: #fff;
+    font-size: 11px;
+    line-height: 1.5;
   }
+
+  /* Page container — A4 210×297mm */
   .page {
-    width: 794px;
-    min-height: 1123px;
-    padding: 48px 52px;
+    width: 210mm; min-height: 297mm;
+    padding: 20mm 18mm 15mm;
     page-break-after: always;
     position: relative;
+    background: #fff;
   }
-  .page:last-child { page-break-after: avoid; }
+  .page:last-child { page-break-after: auto; }
 
-  /* Header bar */
-  .header {
-    display: flex;
-    justify-content: space-between;
-    align-items: flex-start;
-    margin-bottom: 28px;
-    padding-bottom: 16px;
-    border-bottom: 2px solid #C41B46;
+  /* Header/Footer */
+  .page-header {
+    position: absolute; top: 8mm; left: 18mm; right: 18mm;
+    display: flex; justify-content: space-between; align-items: center;
+    font-size: 9px; color: #8A93A3;
+    padding-bottom: 6px; border-bottom: 1px solid #E2E6EC;
   }
-  .brand { font-size: 22px; font-weight: 800; color: #C41B46; letter-spacing: 2px; }
-  .page-title { font-size: 13px; color: #525A68; text-align: right; }
-  .client-name { font-size: 15px; font-weight: 700; color: #16181D; }
-
-  /* ARS Score block */
-  .ars-block {
-    background: #07174E;
-    border-radius: 16px;
-    padding: 32px 36px;
-    margin-bottom: 28px;
-    display: flex;
-    align-items: center;
-    gap: 36px;
+  .brand { font-weight: 800; color: #C41B46; font-size: 12px; letter-spacing: 0.02em; }
+  .page-footer {
+    position: absolute; bottom: 8mm; left: 18mm; right: 18mm;
+    display: flex; justify-content: space-between;
+    font-size: 8.5px; color: #8A93A3;
+    border-top: 1px solid #E2E6EC; padding-top: 5px;
   }
-  .ars-score {
-    font-size: 72px;
-    font-weight: 800;
-    color: #fff;
-    line-height: 1;
-    flex-shrink: 0;
-  }
-  .ars-score span { font-size: 28px; font-weight: 400; opacity: 0.6; }
-  .ars-right { flex: 1; }
-  .ars-band {
-    display: inline-block;
-    padding: 5px 14px;
-    border-radius: 999px;
-    font-size: 13px;
-    font-weight: 700;
-    margin-bottom: 8px;
-  }
-  .ars-headline { font-size: 15px; color: rgba(255,255,255,0.85); line-height: 1.5; }
 
   /* Section heading */
-  .section-heading {
-    font-size: 11px;
-    font-weight: 800;
-    text-transform: uppercase;
-    letter-spacing: 0.08em;
-    color: #8A93A3;
-    margin-bottom: 12px;
+  h1.report-title {
+    font-size: 28px; font-weight: 800; color: #07174E;
+    margin: 40mm 0 8px; line-height: 1.15;
+  }
+  .subtitle { font-size: 13px; color: #525A68; margin-bottom: 30px; }
+
+  .section-num {
+    display: inline-block; width: 26px; height: 26px;
+    border-radius: 50%; background: #C41B46; color: #fff;
+    font-weight: 800; font-size: 12px;
+    text-align: center; line-height: 26px;
+    margin-right: 10px;
+  }
+  h2.section-heading {
+    font-size: 15px; font-weight: 800; color: #07174E;
+    margin: 26px 0 12px; display: flex; align-items: center;
+    text-transform: uppercase; letter-spacing: 0.04em;
+  }
+  h2.section-heading:first-child { margin-top: 0; }
+
+  h3.subsection {
+    font-size: 12px; font-weight: 700; color: #16181D;
+    margin: 16px 0 8px;
+    text-transform: uppercase; letter-spacing: 0.05em;
   }
 
-  /* Dimension scores table */
-  .dim-table { width: 100%; border-collapse: collapse; margin-bottom: 28px; }
-  .dim-table th {
-    font-size: 10px;
-    font-weight: 800;
+  /* Cover — big centered ARS card */
+  .cover-content {
+    display: flex; flex-direction: column; align-items: center;
+    justify-content: center; min-height: 100mm; margin-top: 20mm;
+  }
+  .cover-meta {
+    background: #F6F6F6; border-radius: 12px; padding: 20px 28px;
+    width: 100%; margin-top: 24px;
+    font-size: 11px; color: #525A68;
+  }
+  .cover-meta-row { display: flex; justify-content: space-between; padding: 6px 0; }
+  .cover-meta-row strong { color: #16181D; font-weight: 700; }
+
+  /* ARS hero card */
+  .ars-hero {
+    background: linear-gradient(135deg, #07174E 0%, #0D2A7A 100%);
+    color: #fff; border-radius: 16px;
+    padding: 26px 32px; margin-bottom: 22px;
+    display: flex; align-items: center; gap: 26px;
+  }
+  .ars-hero-score {
+    font-size: 62px; font-weight: 800; line-height: 1;
+    color: #fff; flex-shrink: 0;
+  }
+  .ars-hero-score span { font-size: 22px; color: #D84468; margin-left: 4px; }
+  .ars-hero-info { flex: 1; }
+  .ars-hero-label { font-size: 10px; color: #D84468; text-transform: uppercase; letter-spacing: 0.1em; font-weight: 800; }
+  .ars-hero-band {
+    display: inline-block; margin-top: 6px; padding: 5px 14px;
+    background: rgba(255,255,255,0.18); border-radius: 999px;
+    font-size: 11px; font-weight: 800; letter-spacing: 0.04em;
     text-transform: uppercase;
-    letter-spacing: 0.06em;
-    color: #8A93A3;
-    padding: 8px 12px;
-    text-align: left;
-    background: #F6F6F6;
-    border-bottom: 1px solid #E2E6EC;
+  }
+  .ars-hero-verdict { font-size: 12px; color: rgba(255,255,255,0.85); margin-top: 12px; line-height: 1.5; }
+
+  /* Business Context grid */
+  .bc-grid { display: grid; grid-template-columns: 1fr 1fr; gap: 12px; margin-bottom: 10px; }
+  .bc-card {
+    background: #F6F6F6; border-left: 3px solid #C41B46;
+    border-radius: 8px; padding: 12px 14px;
+  }
+  .bc-label { font-size: 9px; color: #8A93A3; text-transform: uppercase; letter-spacing: 0.05em; font-weight: 700; }
+  .bc-value { font-size: 13px; color: #16181D; font-weight: 700; margin-top: 4px; }
+
+  /* Persona cards */
+  .persona-card {
+    background: #F6F6F6; border-radius: 10px;
+    padding: 12px 16px; margin-bottom: 10px;
+  }
+  .persona-label { font-size: 12px; font-weight: 800; color: #07174E; margin-bottom: 4px; }
+  .persona-just { font-size: 10.5px; color: #525A68; line-height: 1.5; }
+
+  /* Dimension table */
+  .dim-table {
+    width: 100%; border-collapse: collapse; margin-bottom: 10px;
+    font-size: 10.5px;
+  }
+  .dim-table th {
+    background: #07174E; color: #fff; padding: 8px 10px;
+    text-align: left; font-weight: 700; font-size: 10px;
+    text-transform: uppercase; letter-spacing: 0.04em;
   }
   .dim-table td {
-    padding: 10px 12px;
-    font-size: 13px;
-    border-bottom: 1px solid #E2E6EC;
+    padding: 9px 10px; border-bottom: 1px solid #E2E6EC;
     vertical-align: middle;
   }
-  .score-bar-bg {
-    background: #E2E6EC;
-    border-radius: 999px;
-    height: 6px;
-    width: 120px;
-    display: inline-block;
-    vertical-align: middle;
-    margin-right: 8px;
+  .dim-score {
+    display: inline-block; font-weight: 800; font-size: 13px; color: #16181D;
   }
-  .score-bar-fill {
-    background: #C41B46;
-    border-radius: 999px;
-    height: 6px;
-    display: inline-block;
+  .dim-bar-wrap { width: 90px; height: 6px; background: #E2E6EC; border-radius: 999px; overflow: hidden; display: inline-block; margin-left: 6px; vertical-align: middle; }
+  .dim-bar-fill { height: 100%; background: #C41B46; border-radius: 999px; }
+  .dim-band-badge {
+    display: inline-block; padding: 3px 8px; border-radius: 999px;
+    font-size: 9px; font-weight: 800; color: #fff;
+    text-transform: uppercase; letter-spacing: 0.04em;
   }
 
-  /* Severity badges */
-  .sev-badge {
-    display: inline-block;
-    padding: 2px 10px;
-    border-radius: 999px;
-    font-size: 11px;
-    font-weight: 700;
-    color: #fff;
+  /* Insights */
+  .insight-card {
+    border: 1px solid #E2E6EC; border-radius: 10px;
+    padding: 14px 16px; margin-bottom: 12px;
+    background: #fff;
   }
+  .insight-dim { font-size: 9.5px; color: #C41B46; font-weight: 800; text-transform: uppercase; letter-spacing: 0.06em; margin-bottom: 4px; }
+  .insight-title { font-size: 13px; font-weight: 800; color: #07174E; margin-bottom: 6px; }
+  .insight-desc { font-size: 10.5px; color: #525A68; line-height: 1.55; margin-bottom: 10px; }
+  .sg-grid { display: grid; grid-template-columns: 1fr 1fr; gap: 10px; }
+  .sg-box { padding: 10px 12px; border-radius: 8px; }
+  .sg-strengths { background: rgba(31,157,107,0.07); border: 1px solid rgba(31,157,107,0.22); }
+  .sg-gaps      { background: rgba(196,27,70,0.07); border: 1px solid rgba(196,27,70,0.22); }
+  .sg-heading   { font-size: 9px; font-weight: 800; text-transform: uppercase; letter-spacing: 0.06em; margin-bottom: 6px; }
+  .sg-strengths .sg-heading { color: #0F7C4D; }
+  .sg-gaps .sg-heading      { color: #C41B46; }
+  .sg-item { font-size: 10px; color: #16181D; margin-bottom: 4px; padding-left: 12px; position: relative; line-height: 1.4; }
+  .sg-item::before {
+    position: absolute; left: 0; top: 0; font-weight: 800;
+  }
+  .sg-strengths .sg-item::before { content: "✓"; color: #0F7C4D; }
+  .sg-gaps .sg-item::before      { content: "✗"; color: #C41B46; }
 
-  /* Finding card */
-  .finding-card {
-    border: 1px solid #E2E6EC;
-    border-radius: 10px;
-    padding: 16px 18px;
-    margin-bottom: 12px;
+  /* Recommendations */
+  .rec-card {
+    border-left: 4px solid #E2E6EC;
+    background: #F6F6F6; border-radius: 8px;
+    padding: 12px 16px; margin-bottom: 10px;
   }
-  .finding-title { font-size: 14px; font-weight: 700; margin-bottom: 6px; }
-  .finding-meta { font-size: 11px; color: #8A93A3; margin-bottom: 8px; }
-  .finding-impact { font-size: 13px; color: #525A68; line-height: 1.5; }
-
-  /* Footer */
-  .page-footer {
-    position: absolute;
-    bottom: 28px;
-    left: 52px;
-    right: 52px;
-    display: flex;
-    justify-content: space-between;
-    font-size: 10px;
-    color: #8A93A3;
-    border-top: 1px solid #E2E6EC;
-    padding-top: 10px;
+  .rec-card.critical { border-left-color: #C41B46; }
+  .rec-card.high     { border-left-color: #D98A1F; }
+  .rec-card.medium   { border-left-color: #3C8C00; }
+  .rec-header { display: flex; align-items: center; gap: 10px; margin-bottom: 6px; }
+  .rec-priority {
+    display: inline-block; padding: 2px 8px; border-radius: 999px;
+    font-size: 9px; font-weight: 800; color: #fff;
+    text-transform: uppercase; letter-spacing: 0.05em;
   }
-
-  /* Persona row */
-  .persona-row {
-    display: flex;
-    justify-content: space-between;
-    align-items: center;
-    padding: 10px 14px;
-    border-bottom: 1px solid #E2E6EC;
-    font-size: 13px;
-  }
-
-  /* Severity counts grid */
-  .sev-grid {
-    display: flex;
-    gap: 16px;
-    margin-bottom: 28px;
-  }
-  .sev-cell {
-    flex: 1;
-    border: 1px solid #E2E6EC;
-    border-radius: 10px;
-    padding: 16px;
-    text-align: center;
-  }
-  .sev-count { font-size: 36px; font-weight: 800; }
-  .sev-label { font-size: 11px; font-weight: 700; text-transform: uppercase; margin-top: 4px; }
-
-  /* Parameter definition */
-  .param-row {
-    padding: 12px 0;
-    border-bottom: 1px solid #E2E6EC;
-  }
-  .param-name { font-size: 13px; font-weight: 700; margin-bottom: 4px; }
-  .param-desc { font-size: 12px; color: #525A68; line-height: 1.5; }
+  .rec-title { font-size: 12.5px; font-weight: 700; color: #07174E; }
+  .rec-benefit { font-size: 10.5px; color: #525A68; margin-bottom: 4px; line-height: 1.5; }
+  .rec-personas { font-size: 9.5px; color: #8A93A3; font-style: italic; }
+  .rec-solves { font-size: 10px; color: #16181D; margin-top: 4px; }
+  .rec-solves strong { color: #C41B46; font-weight: 700; }
 </style>
 </head>
 <body>
 
-<!-- ═══════════════════════════════════════════════════════ PAGE 1: Cover + Scorecard -->
+<!-- ═══════════════════════ PAGE 1 — COVER ═══════════════════════ -->
 <div class="page">
-  <div class="header">
-    <div>
-      <div class="brand">RAXIS</div>
-      <div style="font-size:11px;color:#8A93A3;margin-top:2px;">Agent Readiness Score Report</div>
-    </div>
-    <div class="page-title">
-      <div class="client-name">${clientName}</div>
-      <div style="margin-top:2px;">${hostname}</div>
-      <div style="margin-top:2px;font-size:11px;">Assessment ID: ${assessmentId}</div>
+  <div class="page-header">
+    <span class="brand">RAXIS</span>
+    <span>Agent Readiness Assessment Report</span>
+  </div>
+
+  <div class="cover-content">
+    <h1 class="report-title">Agent Readiness<br/>Assessment Report</h1>
+    <div class="subtitle">Prepared for ${escapeHtml(d.clientName)}</div>
+
+    <div class="cover-meta">
+      <div class="cover-meta-row"><span>Client</span><strong>${escapeHtml(d.clientName)}</strong></div>
+      <div class="cover-meta-row"><span>Website</span><strong>${escapeHtml(d.websiteUrl)}</strong></div>
+      <div class="cover-meta-row"><span>Assessment Date</span><strong>${dateStr}</strong></div>
+      <div class="cover-meta-row"><span>Assessment ID</span><strong>${escapeHtml(d.assessmentId)}</strong></div>
+      <div class="cover-meta-row"><span>Framework Version</span><strong>${escapeHtml(d.frameworkVersion)}</strong></div>
     </div>
   </div>
 
-  <!-- ARS Score -->
-  <div class="ars-block">
-    <div class="ars-score">${arsScore}<span>/100</span></div>
-    <div class="ars-right">
-      <div class="ars-band" style="background:${bandColor[arsBand] ?? "#1d4ed8"};color:#fff;">
-        ${bandLabel[arsBand] ?? arsBand.toUpperCase()}
-      </div>
-      <div class="ars-headline">
-        ${{
-          excellent:  "This site is well prepared for AI agents.",
-          good:       "This site is moderately ready for AI agents.",
-          needs_work: "Agents will frequently struggle with this site.",
-          not_ready:  "Agents largely cannot use this site.",
-        }[arsBand] ?? ""}
-      </div>
+  <div class="page-footer">
+    <span>RAXIS · Agent Readiness Assessment</span>
+    <span>Page 1</span>
+  </div>
+</div>
+
+<!-- ═══════════════════════ PAGE 2 — HEADLINE + BUSINESS CONTEXT + PERSONAS ═══════════════════════ -->
+<div class="page">
+  <div class="page-header">
+    <span class="brand">RAXIS</span>
+    <span>${escapeHtml(d.clientName)} · ${escapeHtml(d.websiteUrl)}</span>
+  </div>
+
+  <h2 class="section-heading"><span class="section-num">2</span>Headline Result — Agent Readiness Score</h2>
+
+  <div class="ars-hero">
+    <div class="ars-hero-score">${d.arsScore ?? 0}<span>/100</span></div>
+    <div class="ars-hero-info">
+      <div class="ars-hero-label">Agent Readiness Score</div>
+      <div class="ars-hero-band" style="background: ${ars.color}">${ars.label.toUpperCase()}</div>
+      <div class="ars-hero-verdict">${ars.verdict}</div>
     </div>
   </div>
 
-  <!-- Dimension Scores -->
-  <div class="section-heading">Dimension Scores</div>
+  <h2 class="section-heading"><span class="section-num">3</span>Business Context</h2>
+
+  <div class="bc-grid">
+    <div class="bc-card">
+      <div class="bc-label">Archetype</div>
+      <div class="bc-value">${escapeHtml(archetype)}</div>
+    </div>
+    <div class="bc-card">
+      <div class="bc-label">Business Model</div>
+      <div class="bc-value">${escapeHtml(model)}</div>
+    </div>
+    <div class="bc-card">
+      <div class="bc-label">Primary Action Surface</div>
+      <div class="bc-value">${escapeHtml(primaryAct)}</div>
+    </div>
+    <div class="bc-card">
+      <div class="bc-label">Audience</div>
+      <div class="bc-value">${escapeHtml(audience)}</div>
+    </div>
+  </div>
+
+  <h2 class="section-heading"><span class="section-num">4</span>Personas Audited</h2>
+
+  ${confirmed.map(p => `
+    <div class="persona-card">
+      <div class="persona-label">${escapeHtml((p.display_label as string) ?? (p.catalog_persona as string) ?? (p.persona_id as string) ?? "—")}</div>
+      <div class="persona-just">${escapeHtml((p.justification as string) ?? (p.relevance as string) ?? "—")}</div>
+    </div>
+  `).join("")}
+
+  <div class="page-footer">
+    <span>RAXIS · Agent Readiness Assessment</span>
+    <span>Page 2</span>
+  </div>
+</div>
+
+<!-- ═══════════════════════ PAGE 3 — DIMENSION BREAKDOWN ═══════════════════════ -->
+<div class="page">
+  <div class="page-header">
+    <span class="brand">RAXIS</span>
+    <span>${escapeHtml(d.clientName)} · ${escapeHtml(d.websiteUrl)}</span>
+  </div>
+
+  <h2 class="section-heading"><span class="section-num">5</span>Dimension Breakdown</h2>
+
+  <p style="font-size: 10.5px; color: #525A68; margin-bottom: 14px; line-height: 1.5;">
+    How the site scored on each readiness dimension selected for this assessment.
+    Band anchors: Exemplary 90–100, Strong 70–89, Workable 50–69, Impaired 30–49, Blocking 0–29.
+  </p>
+
   <table class="dim-table">
     <thead>
       <tr>
-        <th>Dimension</th>
-        <th>Score</th>
-        <th>Weight</th>
+        <th style="width: 40%">Dimension</th>
+        <th style="width: 25%">Score</th>
+        <th style="width: 20%">Band</th>
+        <th style="width: 15%">Weight</th>
       </tr>
     </thead>
     <tbody>
-      ${dimensionScores.map(d => `
-      <tr>
-        <td style="font-weight:600;">${d.name}</td>
-        <td>
-          <span class="score-bar-bg">
-            <span class="score-bar-fill" style="width:${d.score * 1.2}px;"></span>
-          </span>
-          <strong>${d.score}/100</strong>
-        </td>
-        <td style="color:#8A93A3;">${d.weight}%</td>
-      </tr>`).join("")}
+      ${d.dimensionScores.map(dim => {
+        const score = (dim.score as number) ?? 0;
+        const band  = dimensionBand(score);
+        return `
+        <tr>
+          <td style="font-weight: 700; color: #16181D;">${escapeHtml((dim.name as string) ?? "")}</td>
+          <td>
+            <span class="dim-score">${score}</span>
+            <div class="dim-bar-wrap"><div class="dim-bar-fill" style="width: ${score}%"></div></div>
+          </td>
+          <td><span class="dim-band-badge" style="background: ${band.color}">${band.label}</span></td>
+          <td style="color: #525A68;">${(dim.weight as number) ?? 0}%</td>
+        </tr>`;
+      }).join("")}
     </tbody>
   </table>
 
   <div class="page-footer">
-    <span>Generated by RAXIS — AI Agent Readiness Audit System</span>
-    <span>Page 1 of 4</span>
+    <span>RAXIS · Agent Readiness Assessment</span>
+    <span>Page 3</span>
   </div>
 </div>
 
-<!-- ═══════════════════════════════════════════════════════ PAGE 2: Persona + Severity + Findings Overview -->
+<!-- ═══════════════════════ PAGE 4+ — INSIGHTS (one per page or grouped) ═══════════════════════ -->
+${d.insights.map((ins, idx) => `
 <div class="page">
-  <div class="header">
-    <div>
-      <div class="brand">RAXIS</div>
-      <div style="font-size:11px;color:#8A93A3;margin-top:2px;">Persona &amp; Severity Breakdown</div>
-    </div>
-    <div class="page-title">
-      <div class="client-name">${clientName}</div>
-      <div style="margin-top:2px;">${hostname}</div>
-    </div>
+  <div class="page-header">
+    <span class="brand">RAXIS</span>
+    <span>${escapeHtml(d.clientName)} · ${escapeHtml(d.websiteUrl)}</span>
   </div>
 
-  <!-- Per-Persona ARS -->
-  <div class="section-heading">Per-Persona ARS Breakdown</div>
-  <div style="border:1px solid #E2E6EC;border-radius:10px;overflow:hidden;margin-bottom:28px;">
-    <div style="display:flex;justify-content:space-between;padding:8px 14px;background:#F6F6F6;">
-      <span style="font-size:10px;font-weight:800;text-transform:uppercase;letter-spacing:0.06em;color:#8A93A3;">Persona</span>
-      <span style="font-size:10px;font-weight:800;text-transform:uppercase;letter-spacing:0.06em;color:#8A93A3;">Score / Band</span>
-    </div>
-    ${personaScores.map(p => `
-    <div class="persona-row">
-      <span style="font-weight:600;">${p.display_label}</span>
-      <span><strong>${p.score}/100</strong> <span style="color:#8A93A3;font-size:11px;">${p.band.replace("_"," ").toUpperCase()}</span></span>
-    </div>`).join("")}
-  </div>
+  ${idx === 0 ? `<h2 class="section-heading"><span class="section-num">6</span>Insights</h2>` : ""}
 
-  <!-- Severity Counts -->
-  <div class="section-heading">Severity Counts</div>
-  <div class="sev-grid">
-    <div class="sev-cell">
-      <div class="sev-count" style="color:#C41B46;">${severityCounts.Critical}</div>
-      <div class="sev-label" style="color:#C41B46;">Critical</div>
-    </div>
-    <div class="sev-cell">
-      <div class="sev-count" style="color:#D98A1F;">${severityCounts.High}</div>
-      <div class="sev-label" style="color:#D98A1F;">High</div>
-    </div>
-    <div class="sev-cell">
-      <div class="sev-count" style="color:#3C8C00;">${severityCounts.Medium}</div>
-      <div class="sev-label" style="color:#3C8C00;">Medium</div>
+  <div class="insight-card">
+    <div class="insight-dim">${escapeHtml((ins.dimension_name as string) ?? (ins.dimension_id as string) ?? "")}</div>
+    <div class="insight-title">${escapeHtml((ins.insight_title as string) ?? "")}</div>
+    <div class="insight-desc">${escapeHtml((ins.description as string) ?? "")}</div>
+
+    <div class="sg-grid">
+      <div class="sg-box sg-strengths">
+        <div class="sg-heading">Strengths</div>
+        ${((ins.strengths as string[]) ?? []).map(s => `<div class="sg-item">${escapeHtml(s)}</div>`).join("")}
+      </div>
+      <div class="sg-box sg-gaps">
+        <div class="sg-heading">Gaps</div>
+        ${((ins.gaps as string[]) ?? []).map(g => `<div class="sg-item">${escapeHtml(g)}</div>`).join("")}
+      </div>
     </div>
   </div>
-
-  <!-- Findings Overview -->
-  <div class="section-heading">Findings Overview</div>
-  <table class="dim-table">
-    <thead>
-      <tr>
-        <th>Severity</th>
-        <th>Finding</th>
-        <th>Personas</th>
-        <th>Dimension</th>
-      </tr>
-    </thead>
-    <tbody>
-      ${findings.slice(0, 6).map(f => `
-      <tr>
-        <td><span class="sev-badge" style="background:${sevColor[f.severity] ?? "#8A93A3"};">${f.severity}</span></td>
-        <td style="font-size:12px;">${f.title}</td>
-        <td style="font-size:11px;color:#8A93A3;">${personasStr(f.personas)}</td>
-        <td style="font-size:11px;color:#8A93A3;">${(f as any).dimension_id ?? (f as any).dimension ?? ""}</td>
-      </tr>`).join("")}
-    </tbody>
-  </table>
 
   <div class="page-footer">
-    <span>Generated by RAXIS — AI Agent Readiness Audit System</span>
-    <span>Page 2 of 4</span>
+    <span>RAXIS · Agent Readiness Assessment</span>
+    <span>Page ${4 + idx}</span>
   </div>
 </div>
+`).join("")}
 
-<!-- ═══════════════════════════════════════════════════════ PAGE 3: Detailed Findings -->
+<!-- ═══════════════════════ RECOMMENDATIONS ═══════════════════════ -->
 <div class="page">
-  <div class="header">
-    <div>
-      <div class="brand">RAXIS</div>
-      <div style="font-size:11px;color:#8A93A3;margin-top:2px;">Detailed Findings</div>
-    </div>
-    <div class="page-title">
-      <div class="client-name">${clientName}</div>
-      <div style="margin-top:2px;">${hostname}</div>
-    </div>
+  <div class="page-header">
+    <span class="brand">RAXIS</span>
+    <span>${escapeHtml(d.clientName)} · ${escapeHtml(d.websiteUrl)}</span>
   </div>
 
-  <div class="section-heading">Detailed Findings</div>
-  ${findings.map(f => `
-  <div class="finding-card">
-    <div style="display:flex;align-items:center;gap:10px;margin-bottom:6px;">
-      <span class="sev-badge" style="background:${sevColor[f.severity] ?? "#8A93A3"};">${f.severity}</span>
-      <span class="finding-title" style="margin:0;">${f.title}</span>
-    </div>
-    <div class="finding-meta">
-    Personas: ${personasStr(f.personas)} &nbsp;·&nbsp; Dimension: ${(f as any).dimension_id ?? (f as any).dimension ?? (f as any).dimension ?? ""}
-    </div>
-    <div class="finding-impact">${f.business_impact}</div>
-  </div>`).join("")}
+  <h2 class="section-heading"><span class="section-num">7</span>Recommendations</h2>
+
+  <p style="font-size: 10.5px; color: #525A68; margin-bottom: 14px; line-height: 1.5;">
+    High-level components to collect and build in order to make this site agent-ready.
+    Priority derived from the severity of the underlying finding.
+  </p>
+
+  ${d.neededComponents.map(rec => {
+    const priority = (rec.priority as string) ?? "Medium";
+    const priorityClass = priority.toLowerCase();
+    const color = PRIORITY_COLORS[priority] ?? "#8A93A3";
+    const personas = Array.isArray(rec.personas) ? (rec.personas as string[]).join(", ") : ((rec.personas as string) ?? "—");
+    return `
+    <div class="rec-card ${priorityClass}">
+      <div class="rec-header">
+        <span class="rec-priority" style="background: ${color}">${priority.toUpperCase()}</span>
+        <span class="rec-title">${escapeHtml((rec.title as string) ?? "")}</span>
+      </div>
+      <div class="rec-benefit">${escapeHtml((rec.projected_benefit as string) ?? "")}</div>
+      <div class="rec-solves">${escapeHtml((rec.why_recommended as string) ?? "")}</div>
+      <div class="rec-personas" style="margin-top: 4px;">Personas: ${escapeHtml(personas)}</div>
+    </div>`;
+  }).join("")}
 
   <div class="page-footer">
-    <span>Generated by RAXIS — AI Agent Readiness Audit System</span>
-    <span>Page 3 of 4</span>
-  </div>
-</div>
-
-<!-- ═══════════════════════════════════════════════════════ PAGE 4: Parameter Definitions + Priority Rationale -->
-<div class="page">
-  <div class="header">
-    <div>
-      <div class="brand">RAXIS</div>
-      <div style="font-size:11px;color:#8A93A3;margin-top:2px;">Detailed Description</div>
-    </div>
-    <div class="page-title">
-      <div class="client-name">${clientName}</div>
-      <div style="margin-top:2px;">${hostname}</div>
-    </div>
-  </div>
-
-  <!-- Parameter Definitions -->
-  <div class="section-heading">Parameter Definitions</div>
-  <div style="margin-bottom:28px;">
-    ${dimensionScoresFull.map(d => `
-    <div class="param-row">
-      <div class="param-name">${d.name}</div>
-      <div class="param-desc">${d.description ?? dimDescriptions[d.name] ?? ""}</div>
-    </div>`).join("")}
-  </div>
-
-  <!-- Finding Priority Rationale -->
-  <div class="section-heading">Finding Details &amp; Priority Rationale</div>
-  ${findings.filter(f => f.description || f.priority_reason).map(f => `
-  <div class="finding-card">
-    <div style="display:flex;align-items:center;gap:10px;margin-bottom:6px;">
-      <span class="sev-badge" style="background:${sevColor[f.severity] ?? "#8A93A3"};">${f.severity}</span>
-      <span class="finding-title" style="margin:0;">${f.title}</span>
-    </div>
-    ${f.description ? `<div class="finding-impact" style="margin-bottom:8px;">${f.description}</div>` : ""}
-    ${f.priority_reason ? `
-    <div style="background:#F6F6F6;border-radius:6px;padding:10px 12px;font-size:12px;color:#525A68;line-height:1.5;">
-      <strong>Priority rationale:</strong> ${f.priority_reason}
-    </div>` : ""}
-  </div>`).join("")}
-
-  <div class="page-footer">
-    <span>Generated by RAXIS — AI Agent Readiness Audit System</span>
-    <span>Page 4 of 4</span>
+    <span>RAXIS · Agent Readiness Assessment</span>
+    <span>Page ${4 + d.insights.length}</span>
   </div>
 </div>
 
@@ -534,14 +465,22 @@ function buildPdfHtml(data: {
 </html>`;
 }
 
+function escapeHtml(text: string): string {
+  if (typeof text !== "string") return "";
+  return text
+    .replace(/&/g, "&amp;")
+    .replace(/</g, "&lt;")
+    .replace(/>/g, "&gt;")
+    .replace(/"/g, "&quot;")
+    .replace(/'/g, "&#039;");
+}
+
 // ─────────────────────────────────────────────────────────────────────────────
-// Generate PDF using Puppeteer
+// Generate PDF buffer via Puppeteer
 // ─────────────────────────────────────────────────────────────────────────────
 
 async function generatePdfBuffer(html: string): Promise<Buffer> {
-  // Dynamic import — puppeteer is only loaded when needed
-  const puppeteer = await import("puppeteer");
-  const browser   = await puppeteer.default.launch({
+  const browser = await puppeteer.launch({
     headless: true,
     args: ["--no-sandbox", "--disable-setuid-sandbox"],
   });
@@ -549,116 +488,88 @@ async function generatePdfBuffer(html: string): Promise<Buffer> {
   try {
     const page = await browser.newPage();
     await page.setContent(html, { waitUntil: "networkidle0" });
-    const pdf = await page.pdf({
-      format:            "A4",
-      printBackground:   true,
-      margin: { top: "0", right: "0", bottom: "0", left: "0" },
+    const pdfBuffer = await page.pdf({
+      format: "A4",
+      printBackground: true,
+      preferCSSPageSize: true,
+      margin: { top: 0, right: 0, bottom: 0, left: 0 },
     });
-    return Buffer.from(pdf);
+    return Buffer.from(pdfBuffer);
   } finally {
     await browser.close();
   }
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
-// Generate ZIP buffer containing agents.md and llms.txt
-// ─────────────────────────────────────────────────────────────────────────────
-
-async function generateZipBuffer(
-  agentsMd: string,
-  llmsTxt: string,
-  clientSlug: string
-): Promise<Buffer> {
-  // Dynamic import
-  const archiver = await import("archiver");
-  const { Writable } = await import("stream");
-
-  return new Promise((resolve, reject) => {
-    const chunks: Buffer[] = [];
-
-    const writable = new Writable({
-      write(chunk, _enc, cb) {
-        chunks.push(Buffer.isBuffer(chunk) ? chunk : Buffer.from(chunk));
-        cb();
-      },
-    });
-
-    writable.on("finish", () => resolve(Buffer.concat(chunks)));
-    writable.on("error",  reject);
-
-    const archive = archiver.default("zip", { zlib: { level: 9 } });
-    archive.on("error", reject);
-    archive.pipe(writable);
-
-    archive.append(agentsMd, { name: "agents.md" });
-    archive.append(llmsTxt,  { name: "llms.txt" });
-    archive.finalize();
-  });
-}
-
-// ─────────────────────────────────────────────────────────────────────────────
-// Main export: generateAndUploadPdf
-// Called by pipeline.ts immediately after Call 2 + ARS computation
+// Generate and upload PDF to Supabase Storage
 // ─────────────────────────────────────────────────────────────────────────────
 
 export async function generateAndUploadPdf(assessmentId: string): Promise<void> {
   console.log(`[PDF ${assessmentId}] Starting PDF generation`);
 
-  // Fetch all data needed for the PDF from the database
+  // Fetch assessment
   const { data, error } = await supabase
     .from("assessments")
-    .select([
-      "client_name",
-      "website_url",
-      "ars_score",
-      "ars_band",
-      "dimension_scores",
-      "persona_scores",
-      "severity_counts",
-      "findings",
-    ].join(", "))
+    .select("*")
     .eq("id", assessmentId)
     .single();
 
   if (error || !data) {
-    throw new Error(`Assessment ${assessmentId} not found for PDF generation`);
+    console.error(`[PDF ${assessmentId}] Failed to fetch assessment:`, error);
+    return;
   }
 
   const html = buildPdfHtml({
-    clientName:          data.client_name,
-    websiteUrl:          data.website_url,
+    clientName:       data.client_name ?? "Client",
+    websiteUrl:       data.website_url ?? data.url ?? "—",
     assessmentId,
-    arsScore:            data.ars_score,
-    arsBand:             data.ars_band,
-    dimensionScores:     data.dimension_scores ?? [],
-    personaScores:       data.persona_scores   ?? [],
-    severityCounts:      data.severity_counts  ?? { Critical: 0, High: 0, Medium: 0 },
-    findings:            data.findings         ?? [],
-    dimensionScoresFull: data.dimension_scores ?? [],
+    frameworkVersion: data.framework_version ?? "v1.0",
+    generatedAt:      data.updated_at ?? new Date().toISOString(),
+    arsScore:         data.ars_score,
+    businessContext:  data.business_context ?? {},
+    personas:         data.personas ?? [],
+    dimensionScores:  data.dimension_scores ?? [],
+    insights:         data.insights ?? [],
+    neededComponents: data.needed_components ?? [],
   });
 
   const pdfBuffer = await generatePdfBuffer(html);
 
-  const clientSlug = data.client_name
+  // Upload to Supabase Storage
+  const clientSlug = (data.client_name ?? "client")
     .toLowerCase()
     .replace(/[^a-z0-9]+/g, "-")
     .replace(/^-|-$/g, "");
+  const filename = `RAXIS-ARS-Report-${clientSlug}-${assessmentId.slice(0, 8)}.pdf`;
+  const storagePath = `${assessmentId}/${filename}`;
 
-  const filename  = `${assessmentId}/raxis-${clientSlug}-report.pdf`;
-  const signedUrl = await uploadToSupabase(pdfBuffer, filename, "application/pdf");
+  const { error: uploadErr } = await supabase.storage
+    .from("raxis-reports")
+    .upload(storagePath, pdfBuffer, {
+      contentType: "application/pdf",
+      upsert: true,
+    });
 
-  // Store the signed URL on the assessment record
+  if (uploadErr) {
+    console.error(`[PDF ${assessmentId}] Upload failed:`, uploadErr);
+    return;
+  }
+
+  // Get signed URL
+  const { data: signed } = await supabase.storage
+    .from("raxis-reports")
+    .createSignedUrl(storagePath, 3600);
+
   await supabase
     .from("assessments")
-    .update({ report_pdf_url: signedUrl })
+    .update({ report_pdf_url: signed?.signedUrl ?? null })
     .eq("id", assessmentId);
 
   console.log(`[PDF ${assessmentId}] Complete — uploaded to Supabase Storage`);
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
-// Main export: generateAndUploadZip
-// Called by pipeline.ts immediately after Call 4 completes
+// Generate and upload ZIP (agents.md + llms.txt) — unchanged
 // ─────────────────────────────────────────────────────────────────────────────
 
 export async function generateAndUploadZip(assessmentId: string): Promise<void> {
@@ -671,25 +582,54 @@ export async function generateAndUploadZip(assessmentId: string): Promise<void> 
     .single();
 
   if (error || !data || !data.agent_interface_bundle) {
-    throw new Error(`Assessment ${assessmentId} has no agent interface bundle`);
+    console.error(`[ZIP ${assessmentId}] Missing agent_interface_bundle`);
+    return;
   }
 
-  const bundle   = data.agent_interface_bundle as Record<string, string>;
+  const bundle = data.agent_interface_bundle as Record<string, string>;
   const agentsMd = bundle.companion_file_agents_md ?? "";
   const llmsTxt  = bundle.llms_txt ?? "";
 
-  const clientSlug = data.client_name
+  // Build ZIP using a proper Promise-based stream collection
+  const zipBuffer = await new Promise<Buffer>((resolve, reject) => {
+    const chunks: Buffer[] = [];
+    const archive = archiver("zip", { zlib: { level: 9 } });
+
+    archive.on("data", (chunk: Buffer) => chunks.push(chunk));
+    archive.on("end",  () => resolve(Buffer.concat(chunks)));
+    archive.on("error", (err) => reject(err));
+
+    archive.append(agentsMd, { name: "agents.md" });
+    archive.append(llmsTxt,  { name: "llms.txt" });
+    archive.finalize();
+  });
+
+  const clientSlug = (data.client_name ?? "client")
     .toLowerCase()
     .replace(/[^a-z0-9]+/g, "-")
     .replace(/^-|-$/g, "");
+  const filename = `RAXIS-Agent-Interface-${clientSlug}-${assessmentId.slice(0, 8)}.zip`;
+  const storagePath = `${assessmentId}/${filename}`;
 
-  const zipBuffer = await generateZipBuffer(agentsMd, llmsTxt, clientSlug);
-  const filename  = `${assessmentId}/raxis-${clientSlug}-agent-files.zip`;
-  const signedUrl = await uploadToSupabase(zipBuffer, filename, "application/zip");
+  const { error: uploadErr } = await supabase.storage
+    .from("raxis-reports")
+    .upload(storagePath, zipBuffer, {
+      contentType: "application/zip",
+      upsert: true,
+    });
+
+  if (uploadErr) {
+    console.error(`[ZIP ${assessmentId}] Upload failed:`, uploadErr);
+    return;
+  }
+
+  const { data: signed } = await supabase.storage
+    .from("raxis-reports")
+    .createSignedUrl(storagePath, 3600);
 
   await supabase
     .from("assessments")
-    .update({ report_zip_url: signedUrl })
+    .update({ report_zip_url: signed?.signedUrl ?? null })
     .eq("id", assessmentId);
 
   console.log(`[ZIP ${assessmentId}] Complete — uploaded to Supabase Storage`);

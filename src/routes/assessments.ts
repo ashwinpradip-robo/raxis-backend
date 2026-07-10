@@ -25,7 +25,7 @@ function mapRowToApi(row: Record<string, unknown>) {
     score:        row.ars_score ?? null,
     ars_score:    row.ars_score ?? null,
     status:       mapStatus(row.status as string),
-    last_step:    deriveLastStep(row.status as string),
+    last_step:    deriveLastStep(row),
   };
 }
 
@@ -46,14 +46,33 @@ function mapStatus(dbStatus: string): string {
 
 // Derive the last step for Resume button routing
 // Matches ROUTES.assessmentResume() in lib/routes.ts
-function deriveLastStep(dbStatus: string): string {
-  switch (dbStatus) {
-    case "personas_pending":    return "personas";
-    case "auditing":            return "scorecard";
-    case "draft":               return "components";
-    case "completed":           return "output";
-    default:                    return "url";
-  }
+function deriveLastStep(row: Record<string, unknown>): string {
+  const status = row.status as string;
+
+  // Terminal states
+  if (status === "completed") return "output";
+  if (status === "failed")    return "url";
+
+  // Data-based checks for advanced steps (in case status wasn't updated)
+  const hasBundle    = Boolean(row.agent_interface_bundle);
+  const hasFinalList = Array.isArray(row.final_component_list)
+    && (row.final_component_list as unknown[]).length > 0;
+  const hasArs       = row.ars_score !== null && row.ars_score !== undefined;
+
+  if (hasBundle)    return "output";
+  if (hasFinalList) return "builder";
+  if (hasArs)       return "scorecard";
+
+  // Status-based checks for early steps
+  // "personas_pending" means Call 1 done, consultant needs to confirm personas
+  if (status === "personas_pending") return "personas";
+
+  // "auditing" means Call 2 is running or just done — go to scorecard
+  if (status === "auditing") return "scorecard";
+
+  // Fallback — if URL is set but no personas yet, we're on URL step
+  if (row.website_url) return "url";
+  return "url";
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -80,7 +99,7 @@ router.get("/", async (req: Request, res: Response): Promise<void> => {
     // Fetch paginated rows + total count in one query
     const { data, error, count } = await supabase
       .from("assessments")
-      .select("id, client_name, website_url, status, ars_score, ars_band, created_at, updated_at", { count: "exact" })
+      .select("id, client_name, website_url, status, ars_score, ars_band, personas, final_component_list, agent_interface_bundle, created_at, updated_at", { count: "exact" })
       .eq("consultant_id", req.user!.id)
       .order("updated_at", { ascending: false })
       .range(from, to);
@@ -245,9 +264,10 @@ router.patch("/:id", async (req: Request, res: Response): Promise<void> => {
     }
 
     // Confirm the assessment belongs to this consultant before updating
+    // Also fetch current status to protect pipeline-managed states
     const { data: existing } = await supabase
       .from("assessments")
-      .select("id")
+      .select("id, status, ars_score")
       .eq("id", id)
       .eq("consultant_id", req.user!.id)
       .single();
@@ -255,6 +275,16 @@ router.patch("/:id", async (req: Request, res: Response): Promise<void> => {
     if (!existing) {
       res.status(404).json({ error: "Assessment not found" });
       return;
+    }
+
+    // Status protection — don't let "draft" status overwrite pipeline states
+    // If frontend sends status="draft" but current is "personas_pending" AND
+    // ars_score is not yet computed, keep it as personas_pending (consultant
+    // hasn't confirmed personas yet — Resume should return them to that step)
+    if (updates.status === "draft"
+        && existing.status === "personas_pending"
+        && (existing.ars_score === null || existing.ars_score === undefined)) {
+      delete updates.status;
     }
 
     const { data, error } = await supabase

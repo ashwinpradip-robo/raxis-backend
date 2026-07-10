@@ -56,7 +56,22 @@ HARD RULES — NEVER BREAK THESE
    placeholder key string, do not echo it. Render every credential field as an
    opaque reference only, for example "API key required — obtain from the platform
    developer portal." This is a hard rule, not a preference.
-3. agents.md YAML frontmatter must include:
+3. SYNTAX RULE — Follow markdownguide.org/basic-syntax exactly for both files:
+   - Headings: use # for H1, ## for H2, ### for H3. Always put a space after #.
+     Always put blank lines before and after headings.
+   - Paragraphs: separate with a blank line. Never indent with spaces or tabs.
+   - Blockquotes: use > for summaries and key descriptions. Put blank lines before
+     and after blockquotes.
+   - Unordered lists: use - (dash) only. Never mix *, +, and - in the same list.
+   - Ordered lists: use 1. 2. 3. format. Use periods only, never parentheses.
+   - Links: use [text](url) format. URL encode spaces as %20.
+   - Bold: use **text** for genuinely important terms only. Use sparingly.
+   - Do NOT use tables — use plain bullet lists instead.
+   - Do NOT use backticks or code blocks — write URLs as plain text or links.
+   - Do NOT use horizontal rules (--- or ***).
+   - Do NOT use images.
+   - The YAML frontmatter block is exempt — it must remain valid YAML syntax.
+4. agents.md YAML frontmatter must include:
    - platform (site name)
    - url (site URL)
    - description (one-line summary from business context)
@@ -66,17 +81,18 @@ HARD RULES — NEVER BREAK THESE
        public: list what public-appropriate content agents can access
        governed: describe the access pathway (not the data itself) for governed data
        never: list off-limits categories by name only, no access route
-4. agents.md body sections must include at minimum:
-   - What the platform does (plain-language, 2-3 sentences)
-   - How an agent should navigate it (key sections and their relationship)
-   - Available data and endpoints (from Available components, with auth notes for governed)
-   - Key actions an agent can perform (from Needed action components, with endpoint and
-     auth requirement stated — never with a real credential value)
-   - Links to structured content (key pages, mirroring llms.txt)
-5. llms.txt must follow the llmstxt.org convention:
-   - Opening paragraph: plain-language site summary
-   - Sectioned list: each section is a ## heading (Products, Developers, Resources, etc.)
-     with one bullet per key page: [Page Title](URL) — one-line description
+5. agents.md body sections must include at minimum:
+   - What the platform does (2-3 sentences as a > blockquote)
+   - How an agent should navigate it (key sections as - bullet points)
+   - Available data and endpoints (from Available components as - bullet points)
+   - Key actions an agent can perform (from Needed components as - bullet points
+     with endpoint and auth requirement — never with a real credential value)
+   - Key pages (as - [Title](url) — one-line description per page)
+6. llms.txt must follow the llmstxt.org convention:
+   - Opening H1 with the site name
+   - One > blockquote: plain-language site summary
+   - Sectioned list: each section is a ## heading
+     with one - [Page Title](URL) — one-line description per page
    - Sections and pages come from the Final Component List and business context only
 6. Quality matters as much as correctness. agents.md must read as a document an agent
    could fetch and immediately understand how to work with the platform. llms.txt must
@@ -149,9 +165,10 @@ Each row in `final_component_list`:
 
 ## Expected agents.md structure (reference)
 
-The generated `companion_file_agents_md` should follow this structure:
+The generated `companion_file_agents_md` must follow this structure exactly,
+using proper markdown syntax from markdownguide.org/basic-syntax.
 
-```markdown
+```
 ---
 platform: "Company Name"
 url: "https://example.com"
@@ -162,34 +179,49 @@ access_policy:
   public:
     - "Product documentation"
     - "Published pricing tiers"
-    - "Case studies"
   governed:
     - "Enterprise pricing: available via authenticated quote API at /api/v1/quotes"
   never:
     - "Customer account and CRM data"
 ---
 
-# [Company Name] — Agent Navigation Guide
+# Company Name — Agent Navigation Guide
 
 ## What this platform does
-[2-3 plain-language sentences from business_context.one_line_summary and archetype]
+
+> Company Name is a [description of what the company does] serving [who they serve].
+> All new inquiries are handled through the contact form at /contact.
 
 ## How to navigate this platform
-[Describes the key sections and how they relate — derived from Available components
-and Needed components that add navigation surfaces]
+
+- Homepage at / — aggregates key credentials, services, and entry points
+- Services at /services/ — lists all service lines with dedicated sub-pages
+- Industries at /industries/ — sector-specific capability pages
+- Work at /work/ — published case studies with outcome metrics
+- Contact at /contact — primary inquiry and lead generation surface
 
 ## Available data and endpoints
-[Lists what agents can access, where, and with what auth requirement.
-For governed data: describes the pathway, not the data itself.
-For never-expose data: does not appear here at all.]
+
+- Service descriptions at /services/ — publicly accessible, no authentication required
+- Case studies at /work/ — publicly accessible, no authentication required
+- Blog articles at /blog/ — dated content with author names, publicly accessible
+- Contact form submissions — personal data collected under Privacy Policy, GDPR applies
 
 ## Key actions an agent can perform
-[For each Needed action component: action name, endpoint URL (or reference if
-credential required), HTTP method, auth requirement.
-Never prints a real credential value.]
+
+1. Retrieve service capabilities — GET https://example.com/services/
+2. Read case studies and outcome metrics — GET https://example.com/work/
+3. Discover full content index — GET https://example.com/sitemap.xml
+4. Submit engagement inquiry — POST via contact form at https://example.com/contact, no API available, human review required
 
 ## Key pages
-[Mirrors llms.txt page list — title, URL, one-line description per page]
+
+- [Homepage](https://example.com/) — primary entry point with credentials and services
+- [Services](https://example.com/services/) — full service line index
+- [Work](https://example.com/work/) — published case studies with outcome metrics
+- [Contact](https://example.com/contact) — lead generation and inquiry surface
+- [Blog](https://example.com/blog/) — dated articles with author names
+- [Privacy Policy](https://example.com/privacy-policy/) — data handling obligations
 ```
 
 ---

@@ -531,9 +531,9 @@ Return only the JSON described in the system message.`;
     return;
   }
 
-  // Validate
+  // Validate — allow 2 to 8 personas
   const personas = parsed.personas as Array<Record<string, unknown>>;
-  if (!Array.isArray(personas) || personas.length < 2) {
+  if (!Array.isArray(personas) || personas.length < 2 || personas.length > 8) {
     console.error(`[Call1 ${assessmentId}] Invalid personas count: ${personas?.length}`);
     await supabase.from("assessments").update({ status: "failed" }).eq("id", assessmentId);
     return;
@@ -700,7 +700,7 @@ export async function runAgentInterface(
   // Fetch current assessment state
   const { data: assessment, error } = await supabase
     .from("assessments")
-    .select("business_context, personas, final_component_list, website_url, client_name")
+    .select("business_context, personas, final_component_list, available_components, needed_components, website_url, client_name")
     .eq("id", assessmentId)
     .single();
 
@@ -720,8 +720,11 @@ You output ONLY valid JSON. No text before or after the JSON. No markdown code f
 around the outer JSON. The string values inside the JSON may contain markdown.
 
 YOUR TASK
-From the Final Component List and the business context, generate two markdown strings:
-(a) agents.md — a structured markdown document with YAML frontmatter
+From the Final Component List, business context, and full component details (available + needed
+with their descriptions, dimensions, personas, and granular fields), generate two markdown strings:
+(a) agents.md — a structured markdown document with YAML frontmatter that describes what the
+    platform does AND lists every recommended component (both existing available components
+    AND needed components with their granular field values)
 (b) llms.txt — a community-convention markdown file`;
 
   const interfaceUser = `<spec>
@@ -736,9 +739,31 @@ ${JSON.stringify(assessment.business_context)}
 ${JSON.stringify(confirmedPersonas)}
 </confirmed_personas>
 
+<available_components>
+${JSON.stringify(assessment.available_components ?? [])}
+</available_components>
+
+<needed_components>
+${JSON.stringify(assessment.needed_components ?? [])}
+</needed_components>
+
 <final_component_list>
-${JSON.stringify(assessment.final_component_list)}
+${JSON.stringify(assessment.final_component_list ?? [])}
 </final_component_list>
+
+<website_url>
+${JSON.stringify(assessment.website_url ?? "")}
+</website_url>
+
+<client_name>
+${JSON.stringify(assessment.client_name ?? "")}
+</client_name>
+
+IMPORTANT: The agents.md output MUST include all needed_components in the appropriate sections
+(Available data and endpoints, Key actions an agent can perform, or Key pages). Every needed
+component from the input must appear somewhere in the agents.md body — the consultant filled in
+these values in the builder and expects them in the output. Use the final_component_list values
+where present for the granular field data (URLs, endpoints, descriptions).
 
 Return only the JSON described in the system message.`;
 
