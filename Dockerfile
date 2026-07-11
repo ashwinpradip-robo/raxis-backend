@@ -17,7 +17,7 @@ USER root
 # in this image, so the repo isn't needed for this step.
 RUN find /etc/apt/sources.list.d -type f \( -name '*.list' -o -name '*.sources' \) \
         -exec grep -l 'google' {} \; | xargs -r rm -f \
-    && sed -i '/dl\.google\.com\|dl-ssl\.google\.com/d' /etc/apt/sources.list \
+    && ( [ -f /etc/apt/sources.list ] && sed -i '/dl\.google\.com\|dl-ssl\.google\.com/d' /etc/apt/sources.list || true ) \
     && apt-get update && apt-get install -y curl \
     && curl -fsSL https://deb.nodesource.com/setup_22.x | bash - \
     && apt-get install -y nodejs \
