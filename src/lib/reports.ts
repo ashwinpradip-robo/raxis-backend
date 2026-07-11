@@ -189,7 +189,9 @@ function buildPdfHtml(d: PdfData): string {
     padding: 12px 16px; margin-bottom: 10px;
   }
   .persona-label { font-size: 12px; font-weight: 800; color: #07174E; margin-bottom: 4px; }
-  .persona-just { font-size: 10.5px; color: #525A68; line-height: 1.5; }
+  .persona-field { margin-top: 6px; }
+  .persona-tag { font-size: 8.5px; font-weight: 800; color: #8A93A3; letter-spacing: 0.3px; text-transform: uppercase; }
+  .persona-just { font-size: 10.5px; color: #525A68; line-height: 1.5; margin-top: 1px; }
 
   /* Dimension table */
   .dim-table {
@@ -333,7 +335,15 @@ function buildPdfHtml(d: PdfData): string {
   ${confirmed.map(p => `
     <div class="persona-card">
       <div class="persona-label">${escapeHtml((p.display_label as string) ?? (p.catalog_persona as string) ?? (p.persona_id as string) ?? "—")}</div>
-      <div class="persona-just">${escapeHtml((p.justification as string) ?? (p.relevance as string) ?? "—")}</div>
+      ${p.persona_definition ? `
+      <div class="persona-field">
+        <div class="persona-tag">What it is</div>
+        <div class="persona-just">${escapeHtml(p.persona_definition as string)}</div>
+      </div>` : ""}
+      <div class="persona-field">
+        <div class="persona-tag">Relevance</div>
+        <div class="persona-just">${escapeHtml((p.justification as string) ?? (p.relevance as string) ?? "—")}</div>
+      </div>
     </div>
   `).join("")}
 

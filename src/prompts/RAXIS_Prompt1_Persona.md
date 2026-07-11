@@ -61,13 +61,21 @@ HARD RULES — NEVER BREAK THESE
    include it. Typical sites should return 4–6 personas; complex sites with checkout,
    booking, developer, support, and monitoring surfaces should return 6–8. If more
    than 8 are plausible, keep the 8 highest-relevance ones and note the rest in
-   justification prose.
-   text. Never return fewer than 2.
+   justification prose. Never return fewer than 2.
 6. Evidence-grounded relevance. A persona is relevant only if the site has or
    plausibly targets the surfaces that persona needs. Ground relevance in observed
    evidence, not archetype alone.
 7. Reason only from the snapshot. Do not use outside knowledge about this specific
    company beyond what the crawl shows.
+8. Plain language, client-readable. `persona_definition` and `justification` are each
+   ONE short sentence (roughly 10–18 words) written for a non-technical client, not a
+   developer. No jargon, no framework terminology (never say "archetype", "dimension",
+   "evidence_id", etc. inside these two fields). `persona_definition` describes what
+   this type of agent generally does, independent of this site — base it on the
+   catalog's "Plain-language definition" column, lightly reworded only if needed for
+   grammar. `justification` describes, in plain words, why THIS site attracts that
+   agent — naming one concrete, observed feature (e.g. "a live pricing page and a
+   demo-request form"), not an internal signal name.
 
 OUTPUT SHAPE — return exactly this JSON structure, nothing else:
 {
@@ -106,7 +114,8 @@ OUTPUT SHAPE — return exactly this JSON structure, nothing else:
       "persona_id": "string (from closed set: research | vendor_evaluation | procurement | shopping | booking | lead_generation | application | support | developer | monitoring)",
       "catalog_persona": "string (exact catalog name)",
       "display_label": "string (may be site-specific specialisation)",
-      "justification": "string (one line, grounded in an observed site feature)",
+      "persona_definition": "string (one line, plain language, what this type of agent generally does — see 'Plain-language definition' column in the catalog below; not site-specific)",
+      "justification": "string (one line, plain language, grounded in one observed site feature — this is shown to the client as 'why this persona is relevant here')",
       "evidence_ids": ["ev_0001"],
       "relevance": "high | medium | low",
       "selected": true
@@ -172,11 +181,13 @@ assessments.status            = 'personas_pending'
 ```
 
 ### 3. Feed to Screen 6 (Persona Confirmation)
-Map each persona for the frontend:
+Map each persona for the frontend — the card shows three distinct lines, not a single
+title + description:
 ```
-display name  = persona.display_label  (fall back to persona.catalog_persona)
-description   = persona.justification
-checked       = persona.selected       (always true at this point)
+title            = persona.display_label      (fall back to persona.catalog_persona)
+"What it is"     = persona.persona_definition (generic, one line, plain language)
+"Relevance"      = persona.justification      (site-specific, one line, plain language)
+checked          = persona.selected           (always true at this point)
 ```
 Keep the full persona object in state so `persona_id`, `catalog_persona`, `relevance`, and `evidence_ids` travel forward to Call 2.
 
@@ -194,6 +205,9 @@ Keep the full persona object in state so `persona_id`, `catalog_persona`, `relev
 - [ ] Every `persona_id` is in the valid closed set
 - [ ] Every `selected` field is `true` (pre-confirmation)
 - [ ] Every persona has a non-empty `justification` and at least one `evidence_id`
+- [ ] Every persona has a non-empty `persona_definition`
+- [ ] `persona_definition` and `justification` are each a single plain-language sentence
+      (no framework jargon) — reject and retry if either reads like an internal note
 - [ ] Every `evidence_id` cited in `personas` exists in the `evidence` array
 - [ ] Every `governed` or `never-expose` classification has a non-empty `notes` justification
 - [ ] No real secrets anywhere in the response
@@ -203,18 +217,18 @@ Keep the full persona object in state so `persona_id`, `catalog_persona`, `relev
 
 ## Fixed persona catalog (reference — closed set)
 
-| persona_id | Catalog name | Goal |
-|---|---|---|
-| `research` | Research / Information Agent | Retrieve and cite accurate information |
-| `vendor_evaluation` | Vendor Evaluation / Comparison Agent | Compare offering against alternatives |
-| `procurement` | Procurement Agent | Evaluate and initiate a purchase or contract |
-| `shopping` | Shopping / Transactional Agent | Buy a product on a user's behalf |
-| `booking` | Booking / Reservation Agent | Reserve a slot, room, seat, or appointment |
-| `lead_generation` | Lead-generation / Sign-up Agent | Register interest or create an account |
-| `application` | Application / Onboarding Agent | Complete an application |
-| `support` | Support / Service Agent | Resolve a question or manage an account |
-| `developer` | Developer / Integration Agent | Integrate with the platform programmatically |
-| `monitoring` | Monitoring / Compliance Agent | Track changes, prices, or availability |
+| persona_id | Catalog name | Goal | Plain-language definition (base `persona_definition` on this) |
+|---|---|---|---|
+| `research` | Research / Information Agent | Retrieve and cite accurate information | An AI agent that looks up information on a topic and cites accurate sources. |
+| `vendor_evaluation` | Vendor Evaluation / Comparison Agent | Compare offering against alternatives | An AI agent that compares this business against competitors before recommending one. |
+| `procurement` | Procurement Agent | Evaluate and initiate a purchase or contract | An AI agent that evaluates and helps complete a business purchase or contract. |
+| `shopping` | Shopping / Transactional Agent | Buy a product on a user's behalf | An AI agent that shops and completes a purchase on someone's behalf. |
+| `booking` | Booking / Reservation Agent | Reserve a slot, room, seat, or appointment | An AI agent that books a room, seat, slot, or appointment on someone's behalf. |
+| `lead_generation` | Lead-generation / Sign-up Agent | Register interest or create an account | An AI agent that fills out forms to register interest or create an account. |
+| `application` | Application / Onboarding Agent | Complete an application | An AI agent that fills out and submits an application on someone's behalf. |
+| `support` | Support / Service Agent | Resolve a question or manage an account | An AI agent that answers questions or manages an existing account. |
+| `developer` | Developer / Integration Agent | Integrate with the platform programmatically | An AI agent that connects to this platform's systems and calls its APIs directly. |
+| `monitoring` | Monitoring / Compliance Agent | Track changes, prices, or availability | An AI agent that continuously tracks prices, availability, or changes on the site. |
 
 ---
 
