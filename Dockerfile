@@ -15,6 +15,11 @@ USER root
 # aliases, regardless of filename) — the upstream signing key is expired/rotated,
 # which breaks `apt-get update`. Chrome itself is already installed as a binary
 # in this image, so the repo isn't needed for this step.
+# After installing, force /usr/local/bin/node + npm to point at the new
+# binaries: the base image is built FROM node:20-bookworm, which installs
+# Node at /usr/local/bin/node, and /usr/local/bin comes before /usr/bin in
+# PATH. Nodesource's package installs to /usr/bin/node, so without this the
+# old v20 binary silently keeps winning every `node`/`npm` lookup.
 RUN find /etc/apt/sources.list.d -type f \( -name '*.list' -o -name '*.sources' \) \
         -exec grep -l 'google' {} \; | xargs -r rm -f \
     && ( [ -f /etc/apt/sources.list ] && sed -i '/dl\.google\.com\|dl-ssl\.google\.com/d' /etc/apt/sources.list || true ) \
@@ -22,7 +27,9 @@ RUN find /etc/apt/sources.list.d -type f \( -name '*.list' -o -name '*.sources' 
     && curl -fsSL https://deb.nodesource.com/setup_22.x | bash - \
     && apt-get install -y nodejs \
     && apt-get clean \
-    && rm -rf /var/lib/apt/lists/*
+    && rm -rf /var/lib/apt/lists/* \
+    && ln -sf /usr/bin/node /usr/local/bin/node \
+    && ln -sf /usr/bin/npm /usr/local/bin/npm
 
 # Return to pptruser for the app
 USER pptruser
