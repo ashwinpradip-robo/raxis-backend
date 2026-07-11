@@ -11,7 +11,11 @@ FROM ghcr.io/puppeteer/puppeteer:22.15.0
 USER root
 
 # Install Node 22 (base image ships with Node 20 which lacks native WebSocket)
-RUN apt-get update && apt-get install -y curl \
+# Drop the base image's Google Chrome apt source first — its signing key is
+# expired/rotated upstream, which breaks `apt-get update`. Chrome itself is
+# already installed as a binary in this image, so the repo isn't needed here.
+RUN rm -f /etc/apt/sources.list.d/google-chrome* \
+    && apt-get update && apt-get install -y curl \
     && curl -fsSL https://deb.nodesource.com/setup_22.x | bash - \
     && apt-get install -y nodejs \
     && apt-get clean \
